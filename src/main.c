@@ -31,8 +31,9 @@
 #define WIFI_SSID "ESP32-RPM-Controller"
 #define WIFI_PASS "12345678" // Minimum 8 chars for WPA2
 
-#define PULSE_BUFFER_SIZE 4
-#define ZERO_SPEED_TIMEOUT_US 5000000LL // 5.0s timeout (supports slow speeds down to 12 RPM)
+#define PULSE_BUFFER_SIZE 15
+#define ZERO_SPEED_TIMEOUT_US                                                  \
+  5000000LL // 5.0s timeout (supports slow speeds down to 12 RPM)
 #define PULSES_PER_REV 1
 
 // RPM measurement variables
@@ -41,6 +42,7 @@ static volatile int64_t last_pulse_time_us = 0;
 static volatile int64_t pulse_intervals[PULSE_BUFFER_SIZE] = {0};
 static volatile uint32_t pulse_head = 0;
 static volatile uint32_t pulse_count = 0;
+static volatile uint32_t pulse_raw_count = 0;
 static volatile bool is_new_pulse = false;
 
 // Shared controller state protected by a mutex
@@ -48,7 +50,10 @@ static SemaphoreHandle_t s_state_mutex = NULL;
 static float s_target_rpm = 150.0f;
 static float s_current_rpm = 0.0f;
 static float s_current_pwm = 0.0f;
-static int s_current_gpio = 0;
+static uint32_t s_pulse_count_telemetry = 0;
+static float s_kp = 0.05f;
+static float s_ki = 0.02f;
+static float s_kd = 0.005f;
 
 // GPIO ISR Handler: triggers on falling edge (1 rotation per pulse)
 static void IRAM_ATTR gpio_isr_handler(void *arg) {
@@ -57,7 +62,8 @@ static void IRAM_ATTR gpio_isr_handler(void *arg) {
   if (last_pulse_time_us > 0) {
     int64_t diff = now - last_pulse_time_us;
     // Debounce: ignore glitches shorter than 1000us (max ~60,000 RPM)
-    if (diff > 1000) {
+    if (diff > 120000) {
+      pulse_raw_count++;
       pulse_intervals[pulse_head] = diff;
       pulse_head = (pulse_head + 1) % PULSE_BUFFER_SIZE;
       if (pulse_count < PULSE_BUFFER_SIZE) {
@@ -65,6 +71,9 @@ static void IRAM_ATTR gpio_isr_handler(void *arg) {
       }
       last_pulse_time_us = now;
       is_new_pulse = true;
+
+      // printf("Registered pulse: %lli | Count: %lu | Time: %lli \n", diff,
+      //        pulse_count, last_pulse_time_us);
     }
   } else {
     // First edge detected: just record timestamp to establish reference
@@ -103,10 +112,11 @@ static const char HTML_PAGE[] =
     "1fr;gap:12px;margin-bottom:16px;}"
     ".stat{background:#21262d;padding:12px;border-radius:8px;border:1px solid "
     "#30363d;}"
-    ".label{font-size:12px;color:#8b949e;text-transform:uppercase;}"
+    ".label{font-size:12px;color:#8b949e;text-transform:uppercase;font-weight:"
+    "600;margin-bottom:6px;}"
     ".val{font-size:22px;font-weight:700;color:#f0f6fc;margin-top:4px;}"
     ".unit{font-size:14px;color:#8b949e;font-weight:normal;}"
-    ".form{display:flex;gap:8px;margin-top:12px;}"
+    ".form{display:flex;gap:8px;margin-bottom:16px;}"
     "input{flex:1;background:#0d1117;border:1px solid "
     "#30363d;color:#fff;padding:10px "
     "14px;border-radius:6px;font-size:16px;outline:none;}"
@@ -114,9 +124,21 @@ static const char HTML_PAGE[] =
     "button{background:#238636;color:#fff;border:none;padding:10px "
     "18px;border-radius:6px;cursor:pointer;font-weight:600;font-size:14px;}"
     "button:hover{background:#2ea043;}"
-    ".badge{font-size:12px;padding:2px "
-    "8px;border-radius:12px;background:#30363d;display:inline-block;margin-top:"
-    "8px;}"
+    ".divider{height:1px;background:#30363d;margin:16px 0;}"
+    ".pid-grid{display:grid;grid-template-columns:1fr 1fr "
+    "1fr;gap:8px;margin-bottom:12px;}"
+    ".pid-box{display:flex;flex-direction:column;}"
+    ".pid-box label{font-size:11px;color:#8b949e;text-transform:uppercase;font-"
+    "weight:600;margin-bottom:4px;}"
+    ".pid-box input{padding:8px 10px;font-size:14px;}"
+    ".btn-pid{background:#1f6feb;width:100%;padding:10px;border-radius:6px;"
+    "color:#fff;border:none;cursor:pointer;font-weight:600;font-size:14px;}"
+    ".btn-pid:hover{background:#388bfd;}"
+    ".toast{text-align:center;font-size:12px;min-height:18px;margin-top:8px;"
+    "font-weight:500;}"
+    ".badge{font-size:12px;padding:3px "
+    "10px;border-radius:12px;background:#30363d;display:inline-block;margin-top:"
+    "14px;}"
     "</style></head><body>"
     "<div class='card'>"
     "<h1>⚡ RPM Controller</h1>"
@@ -127,19 +149,32 @@ static const char HTML_PAGE[] =
     "id='crpm'>---</div></div>"
     "<div class='stat'><div class='label'>PWM Duty</div><div class='val' "
     "id='cpwm'>--- <span class='unit'>%</span></div></div>"
-    "<div class='stat'><div class='label'>GPIO 35 Pin</div><div class='val' "
-    "id='cgpio'>---</div></div>"
+    "<div class='stat'><div class='label'>Pulse Count</div><div class='val' "
+    "id='ccnt'>---</div></div>"
     "</div>"
     "<div class='label'>Set Target RPM</div>"
     "<div class='form'>"
     "<input type='number' id='rpmInput' min='0' max='10000' placeholder='e.g. "
-    "1800' />"
-    "<button onclick='setTarget()'>Update</button>"
+    "150' />"
+    "<button onclick='setTarget()'>Set</button>"
     "</div>"
+    "<div class='divider'></div>"
+    "<div class='label'>PID Gains Tuning</div>"
+    "<div class='pid-grid'>"
+    "<div class='pid-box'><label>Kp</label><input type='number' id='kpInput' "
+    "step='0.001' min='0' /></div>"
+    "<div class='pid-box'><label>Ki</label><input type='number' id='kiInput' "
+    "step='0.001' min='0' /></div>"
+    "<div class='pid-box'><label>Kd</label><input type='number' id='kdInput' "
+    "step='0.001' min='0' /></div>"
+    "</div>"
+    "<button class='btn-pid' onclick='setPid()'>Update Gains</button>"
+    "<div id='toast' class='toast'></div>"
     "<div style='text-align:center;'><span class='badge'>Connected via SoftAP: "
     "192.168.4.1</span></div>"
     "</div>"
     "<script>"
+    "let pidLoaded=false;"
     "async function pollData(){"
     "try{"
     "const res=await fetch('/api/status');"
@@ -149,7 +184,13 @@ static const char HTML_PAGE[] =
     "document.getElementById('crpm').innerText=d.rpm.toFixed(1);"
     "document.getElementById('cpwm').innerHTML=d.pwm.toFixed(1)+' <span "
     "class=\"unit\">%</span>';"
-    "document.getElementById('cgpio').innerText=d.gpio;"
+    "document.getElementById('ccnt').innerText=d.count;"
+    "if(!pidLoaded){"
+    "document.getElementById('kpInput').value=d.kp;"
+    "document.getElementById('kiInput').value=d.ki;"
+    "document.getElementById('kdInput').value=d.kd;"
+    "pidLoaded=true;"
+    "}"
     "}"
     "}catch(e){}"
     "}"
@@ -158,6 +199,23 @@ static const char HTML_PAGE[] =
     "if(isNaN(val)||val<0)return alert('Please enter a valid RPM value');"
     "await fetch('/api/target?val='+val,{method:'POST'});"
     "document.getElementById('rpmInput').value='';"
+    "pollData();"
+    "}"
+    "async function setPid(){"
+    "const kp=parseFloat(document.getElementById('kpInput').value);"
+    "const ki=parseFloat(document.getElementById('kiInput').value);"
+    "const kd=parseFloat(document.getElementById('kdInput').value);"
+    "if(isNaN(kp)||isNaN(ki)||isNaN(kd)||kp<0||ki<0||kd<0)return alert('Enter valid non-negative numbers for Kp, Ki, Kd');"
+    "const res=await fetch(`/api/pid?kp=${kp}&ki=${ki}&kd=${kd}`,{method:'POST'});"
+    "const toast=document.getElementById('toast');"
+    "if(res.ok){"
+    "toast.style.color='#3fb950';"
+    "toast.innerText='✓ PID gains updated successfully!';"
+    "}else{"
+    "toast.style.color='#f85149';"
+    "toast.innerText='✗ Error updating PID gains';"
+    "}"
+    "setTimeout(()=>{toast.innerText='';},3000);"
     "pollData();"
     "}"
     "setInterval(pollData,500);pollData();"
@@ -171,21 +229,26 @@ static esp_err_t root_get_handler(httpd_req_t *req) {
 
 // GET /api/status - Return telemetry in JSON
 static esp_err_t status_get_handler(httpd_req_t *req) {
-  char json_buf[128];
+  char json_buf[192];
   float trpm = 0, crpm = 0, cpwm = 0;
-  int cgpio = 0;
+  uint32_t count = 0;
+  float kp = 0, ki = 0, kd = 0;
 
   if (xSemaphoreTake(s_state_mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
     trpm = s_target_rpm;
     crpm = s_current_rpm;
     cpwm = s_current_pwm;
-    cgpio = s_current_gpio;
+    count = s_pulse_count_telemetry;
+    kp = s_kp;
+    ki = s_ki;
+    kd = s_kd;
     xSemaphoreGive(s_state_mutex);
   }
 
   snprintf(json_buf, sizeof(json_buf),
-           "{\"target\":%.1f,\"rpm\":%.1f,\"pwm\":%.1f,\"gpio\":%d}", trpm,
-           crpm, cpwm, cgpio);
+           "{\"target\":%.1f,\"rpm\":%.1f,\"pwm\":%.1f,\"count\":%lu,\"kp\":%."
+           "4f,\"ki\":%.4f,\"kd\":%.4f}",
+           trpm, crpm, cpwm, (unsigned long)count, kp, ki, kd);
 
   httpd_resp_set_type(req, "application/json");
   return httpd_resp_send(req, json_buf, HTTPD_RESP_USE_STRLEN);
@@ -205,6 +268,40 @@ static esp_err_t target_post_handler(httpd_req_t *req) {
           xSemaphoreGive(s_state_mutex);
         }
       }
+    }
+  }
+  httpd_resp_set_type(req, "text/plain");
+  return httpd_resp_send(req, "OK", HTTPD_RESP_USE_STRLEN);
+}
+
+// POST /api/pid?kp=0.05&ki=0.02&kd=0.005 - Update PID gains
+static esp_err_t pid_post_handler(httpd_req_t *req) {
+  char query[128] = {0};
+  if (httpd_req_get_url_query_str(req, query, sizeof(query)) == ESP_OK) {
+    char kp_str[16] = {0};
+    char ki_str[16] = {0};
+    char kd_str[16] = {0};
+
+    float new_kp = -1.0f, new_ki = -1.0f, new_kd = -1.0f;
+
+    if (httpd_query_key_value(query, "kp", kp_str, sizeof(kp_str)) == ESP_OK) {
+      new_kp = atof(kp_str);
+    }
+    if (httpd_query_key_value(query, "ki", ki_str, sizeof(ki_str)) == ESP_OK) {
+      new_ki = atof(ki_str);
+    }
+    if (httpd_query_key_value(query, "kd", kd_str, sizeof(kd_str)) == ESP_OK) {
+      new_kd = atof(kd_str);
+    }
+
+    if (xSemaphoreTake(s_state_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+      if (new_kp >= 0.0f)
+        s_kp = new_kp;
+      if (new_ki >= 0.0f)
+        s_ki = new_ki;
+      if (new_kd >= 0.0f)
+        s_kd = new_kd;
+      xSemaphoreGive(s_state_mutex);
     }
   }
   httpd_resp_set_type(req, "text/plain");
@@ -238,6 +335,13 @@ static httpd_handle_t start_webserver(void) {
         .handler = target_post_handler,
     };
     httpd_register_uri_handler(server, &target_uri);
+
+    httpd_uri_t pid_uri = {
+        .uri = "/api/pid",
+        .method = HTTP_POST,
+        .handler = pid_post_handler,
+    };
+    httpd_register_uri_handler(server, &pid_uri);
   }
   return server;
 }
@@ -337,23 +441,25 @@ void app_main(void) {
   start_webserver();
 
   // Controller configuration
-  float Kp = 0.05f;                // Proportional gain
   float duty_cycle_percent = 0.0f; // Initial PWM duty cycle (0.0% to 100.0%)
   set_pwm_duty_percentage(duty_cycle_percent);
 
   float current_rpm = 0.0f;
+  float integral = 0.0f;
+  float prev_rpm = 0.0f;
+  int64_t last_pid_time_us = esp_timer_get_time();
 
   while (1) {
-    int level = gpio_get_level(INPUT_GPIO_PIN);
-
     int64_t last_time = 0;
     uint32_t count = 0;
+    uint32_t raw_count = 0;
     int64_t intervals[PULSE_BUFFER_SIZE] = {0};
     bool has_new_pulse = false;
 
     portENTER_CRITICAL(&isr_mux);
     last_time = last_pulse_time_us;
     count = pulse_count;
+    raw_count = pulse_raw_count;
     for (int i = 0; i < PULSE_BUFFER_SIZE; i++) {
       intervals[i] = pulse_intervals[i];
     }
@@ -363,7 +469,8 @@ void app_main(void) {
 
     int64_t now = esp_timer_get_time();
 
-    // If no pulse received within zero-speed timeout (5.0s for slow RPMs), consider motor stopped
+    // If no pulse received within zero-speed timeout (5.0s for slow RPMs),
+    // consider motor stopped
     if (last_time == 0 || (now - last_time) >= ZERO_SPEED_TIMEOUT_US) {
       current_rpm = 0.0f;
       portENTER_CRITICAL(&isr_mux);
@@ -375,15 +482,17 @@ void app_main(void) {
       }
       portEXIT_CRITICAL(&isr_mux);
     } else if (has_new_pulse && count >= PULSE_BUFFER_SIZE) {
-      // Calculate mean RPM after 4 pulses have been measured
+      // Calculate mean RPM after 15 pulses have been measured
       int64_t sum_intervals = 0;
       for (int i = 0; i < PULSE_BUFFER_SIZE; i++) {
         sum_intervals += intervals[i];
       }
 
       if (sum_intervals > 0) {
-        float mean_interval_us = (float)sum_intervals / (float)PULSE_BUFFER_SIZE;
-        float calculated_rpm = (60.0f * 1000000.0f) / (mean_interval_us * PULSES_PER_REV);
+        float mean_interval_us =
+            (float)sum_intervals / (float)PULSE_BUFFER_SIZE;
+        float calculated_rpm =
+            (60.0f * 1000000.0f) / (mean_interval_us * PULSES_PER_REV);
 
         // Reject impossible initial spikes (e.g. > 10,000 RPM)
         if (calculated_rpm <= 10000.0f) {
@@ -394,35 +503,80 @@ void app_main(void) {
 
     float rpm = current_rpm;
 
-    // Fetch current target RPM safely
+    // Calculate actual dt for PID controller
+    int64_t now_pid_time = esp_timer_get_time();
+    float dt = (float)(now_pid_time - last_pid_time_us) / 1000000.0f;
+    last_pid_time_us = now_pid_time;
+    if (dt <= 0.0f || dt > 1.0f) {
+      dt = 0.1f; // fallback to 100ms nominal update rate
+    }
+
+    // Fetch current target RPM and PID gains safely
     float target = 0.0f;
+    float kp = 0.0f, ki = 0.0f, kd = 0.0f;
     if (xSemaphoreTake(s_state_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
       target = s_target_rpm;
+      kp = s_kp;
+      ki = s_ki;
+      kd = s_kd;
       // Update telemetry shared with web server
       s_current_rpm = rpm;
       s_current_pwm = duty_cycle_percent;
-      s_current_gpio = level;
+      s_pulse_count_telemetry = raw_count;
       xSemaphoreGive(s_state_mutex);
     }
 
-    // Proportional (P) controller calculation
+    // PID controller calculation
     float error = target - rpm;
-    duty_cycle_percent += Kp * error;
-    // duty_cycle_percent = 75.0f;
 
-    // Clamp duty cycle between 0% and PWM_MAX_DUTY_PERCENT (75% to protect 9V
-    // motor under 12V supply)
-    if (duty_cycle_percent > PWM_MAX_DUTY_PERCENT)
-      duty_cycle_percent = PWM_MAX_DUTY_PERCENT;
-    if (duty_cycle_percent < 0.0f)
+    if (target <= 0.0f) {
+      integral = 0.0f;
       duty_cycle_percent = 0.0f;
+    } else {
+      // Proportional term
+      float p_term = kp * error;
+
+      // Integral term with anti-windup clamping
+      integral += error * dt;
+      if (ki > 0.0f) {
+        float max_integral = PWM_MAX_DUTY_PERCENT / ki;
+        if (integral > max_integral) {
+          integral = max_integral;
+        } else if (integral < 0.0f) {
+          integral = 0.0f; // Only forward motor drive
+        }
+      } else {
+        integral = 0.0f;
+      }
+      float i_term = ki * integral;
+
+      // Derivative term on measurement (avoids derivative kick on target change)
+      float d_term = 0.0f;
+      if (dt > 0.0f) {
+        d_term = -kd * (rpm - prev_rpm) / dt;
+      }
+
+      duty_cycle_percent = p_term + i_term + d_term;
+
+      // Clamp duty cycle between 0% and PWM_MAX_DUTY_PERCENT (75% to protect 9V
+      // motor under 12V supply)
+      if (duty_cycle_percent > PWM_MAX_DUTY_PERCENT) {
+        duty_cycle_percent = PWM_MAX_DUTY_PERCENT;
+      }
+      if (duty_cycle_percent < 0.0f) {
+        duty_cycle_percent = 0.0f;
+      }
+    }
+
+    prev_rpm = rpm;
 
     // Apply updated duty cycle to PWM output
     set_pwm_duty_percentage(duty_cycle_percent);
 
     printf(
-        "Target: %.0f | RPM: %.1f | Error: %.1f | PWM: %.1f%% | GPIO%d: %d\n",
-        target, rpm, error, duty_cycle_percent, INPUT_GPIO_PIN, level);
+        "Target: %.0f | RPM: %.1f | Error: %.1f | PWM: %.1f%% | Kp: %.3f Ki: %.3f Kd: %.3f | Count: %lu\n",
+        target, rpm, error, duty_cycle_percent, kp, ki, kd,
+        (unsigned long)raw_count);
 
     vTaskDelay(pdMS_TO_TICKS(100)); // 100ms update rate
   }

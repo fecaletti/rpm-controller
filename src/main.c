@@ -9,6 +9,7 @@
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "nvs_flash.h"
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -54,6 +55,7 @@ static uint32_t s_pulse_count_telemetry = 0;
 static float s_kp = 0.05f;
 static float s_ki = 0.02f;
 static float s_kd = 0.005f;
+static uint8_t motor_sense = 0;
 
 // GPIO ISR Handler: triggers on falling edge (1 rotation per pulse)
 static void IRAM_ATTR gpio_isr_handler(void *arg) {
@@ -137,7 +139,8 @@ static const char HTML_PAGE[] =
     ".toast{text-align:center;font-size:12px;min-height:18px;margin-top:8px;"
     "font-weight:500;}"
     ".badge{font-size:12px;padding:3px "
-    "10px;border-radius:12px;background:#30363d;display:inline-block;margin-top:"
+    "10px;border-radius:12px;background:#30363d;display:inline-block;margin-"
+    "top:"
     "14px;}"
     "</style></head><body>"
     "<div class='card'>"
@@ -169,6 +172,7 @@ static const char HTML_PAGE[] =
     "step='0.001' min='0' /></div>"
     "</div>"
     "<button class='btn-pid' onclick='setPid()'>Update Gains</button>"
+    "<button class='btn-pid' onclick='toggleSense()'>Revert Sense</button>"
     "<div id='toast' class='toast'></div>"
     "<div style='text-align:center;'><span class='badge'>Connected via SoftAP: "
     "192.168.4.1</span></div>"
@@ -205,8 +209,10 @@ static const char HTML_PAGE[] =
     "const kp=parseFloat(document.getElementById('kpInput').value);"
     "const ki=parseFloat(document.getElementById('kiInput').value);"
     "const kd=parseFloat(document.getElementById('kdInput').value);"
-    "if(isNaN(kp)||isNaN(ki)||isNaN(kd)||kp<0||ki<0||kd<0)return alert('Enter valid non-negative numbers for Kp, Ki, Kd');"
-    "const res=await fetch(`/api/pid?kp=${kp}&ki=${ki}&kd=${kd}`,{method:'POST'});"
+    "if(isNaN(kp)||isNaN(ki)||isNaN(kd)||kp<0||ki<0||kd<0)return alert('Enter "
+    "valid non-negative numbers for Kp, Ki, Kd');"
+    "const res=await "
+    "fetch(`/api/pid?kp=${kp}&ki=${ki}&kd=${kd}`,{method:'POST'});"
     "const toast=document.getElementById('toast');"
     "if(res.ok){"
     "toast.style.color='#3fb950';"
@@ -217,6 +223,9 @@ static const char HTML_PAGE[] =
     "}"
     "setTimeout(()=>{toast.innerText='';},3000);"
     "pollData();"
+    "}"
+    "async function toggleSense(){"
+    "fetch(`/api/sense`,{method:'POST'});"
     "}"
     "setInterval(pollData,500);pollData();"
     "</script></body></html>";
@@ -308,6 +317,15 @@ static esp_err_t pid_post_handler(httpd_req_t *req) {
   return httpd_resp_send(req, "OK", HTTPD_RESP_USE_STRLEN);
 }
 
+static esp_err_t sense_post_handler(httpd_req_t *req) {
+  motor_sense ^= 0x01;
+  gpio_set_level(OUTPUT_PIN_27, 1 - motor_sense);
+  gpio_set_level(OUTPUT_PIN_14, motor_sense);
+
+  httpd_resp_set_type(req, "text/plain");
+  return httpd_resp_send(req, "OK", HTTPD_RESP_USE_STRLEN);
+}
+
 // Start HTTP server
 static httpd_handle_t start_webserver(void) {
   httpd_config_t config = HTTPD_DEFAULT_CONFIG();
@@ -342,6 +360,13 @@ static httpd_handle_t start_webserver(void) {
         .handler = pid_post_handler,
     };
     httpd_register_uri_handler(server, &pid_uri);
+
+    httpd_uri_t sense_uri = {
+        .uri = "/api/sense",
+        .method = HTTP_POST,
+        .handler = sense_post_handler,
+    };
+    httpd_register_uri_handler(server, &sense_uri);
   }
   return server;
 }
@@ -550,7 +575,8 @@ void app_main(void) {
       }
       float i_term = ki * integral;
 
-      // Derivative term on measurement (avoids derivative kick on target change)
+      // Derivative term on measurement (avoids derivative kick on target
+      // change)
       float d_term = 0.0f;
       if (dt > 0.0f) {
         d_term = -kd * (rpm - prev_rpm) / dt;
@@ -573,10 +599,10 @@ void app_main(void) {
     // Apply updated duty cycle to PWM output
     set_pwm_duty_percentage(duty_cycle_percent);
 
-    printf(
-        "Target: %.0f | RPM: %.1f | Error: %.1f | PWM: %.1f%% | Kp: %.3f Ki: %.3f Kd: %.3f | Count: %lu\n",
-        target, rpm, error, duty_cycle_percent, kp, ki, kd,
-        (unsigned long)raw_count);
+    printf("Target: %.0f | RPM: %.1f | Error: %.1f | PWM: %.1f%% | Kp: %.3f "
+           "Ki: %.3f Kd: %.3f | Count: %lu\n",
+           target, rpm, error, duty_cycle_percent, kp, ki, kd,
+           (unsigned long)raw_count);
 
     vTaskDelay(pdMS_TO_TICKS(100)); // 100ms update rate
   }
